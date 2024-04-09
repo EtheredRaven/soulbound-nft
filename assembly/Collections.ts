@@ -23,6 +23,7 @@ const SUPPLY_SPACE_ID = 23;
 const CONFIG_SPACE_ID = 24;
 const SOULDBOUNDS_SPACE_ID = 25;
 
+// Soulbound states
 const SOULBOUND_MINTED = 1;
 const SOULBOUND_BOUNDED = 2;
 
@@ -34,7 +35,7 @@ export class Collections {
   _approvals!: Storage.Map<string, collections.token_approval_object>;
   _operators!: Storage.Map<string, collections.operator_approval_object>;
   _tokensOf!: Storage.Map<Uint8Array, collections.tokens_of_result>;
-  _soulBounds!: Storage.Map<string, collections.uint64_object>;
+  _soulBounds!: Storage.Map<string, collections.uint64_object>; // Map storing the soulbound state of a token
   _config!: Storage.Obj<collections.config_object>;
 
   constructor() {
@@ -320,20 +321,26 @@ export class Collections {
   }
 
   /**
-   * Mint a new token
-   * @external
+   * Mint a new soulbound token
+   * This function allows for the creation of new soulbound tokens, which are non-transferable tokens tied to a single owner.
+   * @param args - Arguments for the mint operation, including the recipient, number of tokens to mint, and soulbound status.
+   * @returns An empty object, indicating successful execution of the mint function.
    */
   mint(args: collections.mint_arguments): collections.empty_object {
+    // Retrieve the owner of the contract from configuration.
     const OWNER = this._config.get()!.owner;
-    let to = args.to; // if everyone can mint, then you can take into account args.to, otherwise it is to the owner anyway
+    // Determine the recipient of the minted tokens. Adjust based on contract permissions or public minting capabilities.
+    let to = args.to;
 
-    // process
+    // Retrieve the current total supply and the balance of the recipient.
     const supply = this._supply.get()!;
     const balance = this._balances.get(to)!;
+    // Calculate the new total supply with the additional tokens.
     const tokens = SafeMath.add(supply.value, args.number_tokens_to_mint);
 
-    // pay mint price token or check creator
+    // Handle the payment for minting tokens or check for creator's permission based on contract setup.
     if (Constants.MINT_FEE) {
+      // If there's a mint fee, require payment in a specific token before minting.
       const token_pay = new Token(Constants.TOKEN_PAY);
       const _result = token_pay.transfer(
         args.to,
@@ -342,40 +349,41 @@ export class Collections {
       );
       System.require(_result, "Failed to pay mint");
     } else if (OWNER.length > 0) {
-      // if OWNER is setup
+      // If an OWNER is specified, require that the caller has the appropriate authority to mint.
       System.requireAuthority(
         authority.authorization_type.contract_call,
         OWNER
       );
     } else {
-      // otherwise, check contract id permissions
+      // Otherwise, check contract ID permissions for minting authority.
       System.requireAuthority(
         authority.authorization_type.contract_call,
         this._contractId
       );
     }
 
-    // check limit amount tokens
+    // Ensure the new total supply does not exceed the predefined limits.
     System.require(tokens > 0, "token id out of bounds");
-    // check limit amount tokens
     System.require(tokens <= Constants.MAX_SUPPLY, "token id out of bounds");
 
-    // assign the new token's owner
+    // Assign ownership of the new tokens.
     const start = SafeMath.add(supply.value, 1);
     const newToken = new collections.token_object();
     let tokenId: string;
 
+    // Loop through each new token to mint it and assign it as soulbound if indicated.
     for (let index = start; index <= tokens; index++) {
       tokenId = index.toString();
-
-      // mint token
       newToken.owner = to;
+      // Store the new token.
       this._tokens.put(tokenId, newToken);
 
+      // Update the list of tokens owned by the recipient.
       const tokensOf = this._tokensOf.get(to)!;
       tokensOf.token_id.push(tokenId);
       this._tokensOf.put(to, tokensOf);
 
+      // If the token is marked as soulbound, assign its status accordingly.
       if (args.soulbound) {
         const soulbound = new collections.uint64_object(
           Arrays.equal(to, OWNER) ? SOULBOUND_MINTED : SOULBOUND_BOUNDED
@@ -383,12 +391,11 @@ export class Collections {
         this._soulBounds.put(tokenId, soulbound);
       }
 
-      // events
+      // Emit a minting event for the new token.
       const mintEvent = new collections.mint_event(
         to,
         StringBytes.stringToBytes(tokenId)
       );
-
       const impacted = [to];
       System.event(
         "collections.mint_event",
@@ -397,22 +404,21 @@ export class Collections {
       );
     }
 
-    // update the owner's balance
+    // Update the recipient's balance with the newly minted tokens.
     balance.value = SafeMath.add(balance.value, args.number_tokens_to_mint);
-
-    // check limit address
+    // Ensure the recipient's balance does not exceed the maximum allowed.
     System.require(
       balance.value <= Constants.MAX_SUPPLY,
       "exceeds the limit of tokens per address"
     );
 
-    // increment supply
+    // Increment the total supply by the number of minted tokens.
     supply.value = SafeMath.add(supply.value, args.number_tokens_to_mint);
-
-    // save new states
+    // Save the updated states for supply and balance.
     this._balances.put(to, balance);
     this._supply.put(supply);
 
+    // Return an empty object to indicate successful minting.
     return new collections.empty_object();
   }
 
@@ -422,32 +428,34 @@ export class Collections {
 
   /**
    * Transfer tokens
-   * @external
+   * This function allows for the transfer of tokens between accounts, with additional logic for handling soulbound tokens.
+   * @param args - The arguments for the transfer, including the sender, receiver, and token ID.
+   * @returns An empty object upon successful execution, indicating the transfer was processed.
    */
   transfer(args: collections.transfer_arguments): collections.empty_object {
-    // data
+    // Extract sender, receiver, and token ID from arguments.
     const from = args.from;
     const to = args.to;
     const token_id = StringBytes.bytesToString(args.token_id);
 
-    // process
+    // Retrieve the token object to work with.
     const token = this._tokens.get(token_id);
 
-    // check if the token exists
+    // Ensure the token exists to prevent transferring non-existent tokens.
     System.require(
       token != null,
       "nonexistent token",
       error.error_code.failure
     );
 
-    // check if owner if from
+    // Verify the 'from' account is the current owner of the token.
     System.require(
       Arrays.equal(token!.owner, from),
       "from is not a owner",
       error.error_code.authorization_failure
     );
 
-    // check if token is soulbounded
+    // Check if the token is soulbound and prevent its transfer if it is.
     const soulbound = this._soulBounds.get(token_id);
     System.require(
       soulbound == null || soulbound.value == SOULBOUND_MINTED,
@@ -455,7 +463,7 @@ export class Collections {
       error.error_code.failure
     );
 
-    // check authorize tokens
+    // Authorization check: Verify the transfer is approved by either direct approval or operator delegation.
     let isTokenApproved: bool = false;
     const caller = System.getCaller();
     if (!Arrays.equal(caller.caller, from)) {
@@ -484,28 +492,26 @@ export class Collections {
         error.error_code.authorization_failure
       );
     }
-    // clear the token approval
+
+    // Clear any token approval after successful transfer authorization.
     this._approvals.remove(token_id);
 
-    // update the owner token
+    // Transfer ownership of the token to the 'to' account.
     token!.owner = to;
 
-    // update the current owner's balance
+    // Update the token balances for both the sender ('from') and receiver ('to').
     const balance_from = this._balances.get(from)!;
     balance_from.value = SafeMath.sub(balance_from.value, 1);
-
-    // update the new owner's balance
     const balance_to = this._balances.get(to)!;
     balance_to.value = SafeMath.add(balance_to.value, 1);
 
-    // update the tokens of list
+    // Update the lists of owned tokens for both accounts involved in the transfer.
     let tokens_list_from = this._tokensOf.get(from)!.token_id;
     let tokens_list_to = this._tokensOf.get(to)!.token_id;
     let token_index = tokens_list_from.indexOf(token_id);
-    // This error should never happend, for testing purposes only
     System.require(
       token_index >= 0,
-      "the sender do not own this token according to tokens list"
+      "the sender does not own this token according to tokens list"
     );
     tokens_list_from.splice(token_index, 1);
     tokens_list_to.push(token_id);
@@ -515,18 +521,18 @@ export class Collections {
     );
     this._tokensOf.put(to, new collections.tokens_of_result(tokens_list_to));
 
-    // save new states
+    // Save the updated token and balance states.
     this._tokens.put(token_id, token!);
     this._balances.put(to, balance_to);
     this._balances.put(from, balance_from);
 
-    // soulbounding if needed
+    // If the token was originally marked as soulbound minted, update its status to soulbound bound.
     if (soulbound != null && soulbound.value == SOULBOUND_MINTED) {
       soulbound.value = SOULBOUND_BOUNDED;
       this._soulBounds.put(token_id, soulbound);
     }
 
-    // generate event
+    // Emit a transfer event for the blockchain to record the transaction.
     const transferEvent = new collections.transfer_event(
       from,
       to,
@@ -539,6 +545,7 @@ export class Collections {
       impacted
     );
 
+    // Return an empty object to indicate the transfer was successfully processed.
     return new collections.empty_object();
   }
 
